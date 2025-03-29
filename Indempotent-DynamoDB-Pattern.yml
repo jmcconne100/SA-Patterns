@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Idempotent Event Processor with DynamoDB Locking
+
+Resources:
+
+  ###############################################
+  # DynamoDB Table for Idempotency Tracking
+  ###############################################
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: idempotency-locks
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ###############################################
+  # SQS Queue for Incoming Events
+  ###############################################
+  IdempotentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: idempotent-event-queue
+
+  ###############################################
+  # IAM Role for Lambda to Access SQS + DynamoDB
+  ###############################################
+  IdempotentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowDynamoSQS
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IdempotentQueue.Arn
+
+  ###############################################
+  # Lambda Function for Idempotent Processing
+  ###############################################
+  IdempotentProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 10
+      Role: !GetAtt IdempotentLambdaRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref IdempotencyTable
+      Code:
+        ZipFile: |
+          import boto3, os, json
+          from botocore.exceptions import ClientError
+          ddb = boto3.resource('dynamodb')
+          table = ddb.Table(os.environ['TABLE_NAME'])
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  event_id = body.get('event_id')
+                  try:
+                      # Check if event already processed
+                      response = table.get_item(Key={'event_id': event_id})
+                      if 'Item' in response:
+                          print(f"Skipping duplicate event_id: {event_id}")
+                          continue
+
+                      # Process event (simulate work)
+                      print(f"Processing event: {body}")
+
+                      # Record as processed
+                      table.put_item(Item={"event_id": event_id})
+
+                  except ClientError as e:
+                      print(f"Error checking/setting idempotency: {e}")
+
+  ###############################################
+  # Event Source Mapping - SQS → Lambda
+  ###############################################
+  IdempotentSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt IdempotentQueue.Arn
+      FunctionName: !Ref IdempotentProcessor
+      MaximumBatchingWindowInSeconds: 5
+
+Outputs:
+  QueueUrl:
+    Value: !Ref IdempotentQueue
+  TableName:
+    Value: !Ref IdempotencyTable
+  LambdaName:
+    Value: !Ref IdempotentProcessor

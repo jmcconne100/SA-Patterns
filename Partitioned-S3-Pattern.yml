@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 Partitioned Writer using Lambda and Folder-Based Paths
+
+Resources:
+
+  ###############################################
+  # S3 Bucket for Partitioned Writes
+  ###############################################
+  PartitionedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub partitioned-s3-bucket-${AWS::AccountId}-${AWS::Region}
+
+  ###############################################
+  # SQS Queue for Incoming Events
+  ###############################################
+  PartitionedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: partitioned-s3-queue
+
+  ###############################################
+  # IAM Role for Lambda
+  ###############################################
+  PartitionedWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowS3WriteAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt PartitionedQueue.Arn
+
+  ###############################################
+  # Lambda Function to Write Events to Partitioned Paths
+  ###############################################
+  PartitionedWriter:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 10
+      Role: !GetAtt PartitionedWriterRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref PartitionedBucket
+      Code:
+        ZipFile: |
+          import boto3, os, json, uuid, datetime
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  ts = body.get('timestamp', datetime.datetime.utcnow().isoformat())
+                  dt = datetime.datetime.fromisoformat(ts.replace("Z", ""))
+                  year = dt.strftime('%Y')
+                  month = dt.strftime('%m')
+                  day = dt.strftime('%d')
+                  key = f"year={year}/month={month}/day={day}/evt_{uuid.uuid4().hex}.json"
+                  s3.put_object(
+                      Bucket=os.environ['BUCKET_NAME'],
+                      Key=key,
+                      Body=json.dumps(body).encode('utf-8')
+                  )
+                  print(f"📁 Wrote event to partition: {key}")
+
+  ###############################################
+  # Event Source Mapping - SQS → Lambda
+  ###############################################
+  PartitionedEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt PartitionedQueue.Arn
+      FunctionName: !Ref PartitionedWriter
+      MaximumBatchingWindowInSeconds: 5
+
+Outputs:
+  PartitionedBucket:
+    Value: !Ref PartitionedBucket
+  PartitionedQueue:
+    Value: !Ref PartitionedQueue
+  PartitionedLambda:
+    Value: !Ref PartitionedWriter

@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Event Sampler + Firehose Integration for S3-based Observability
+
+Resources:
+
+  ###############################################
+  # S3 Bucket for Sampled Event Storage
+  ###############################################
+  SampledEventBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sampled-events-${AWS::AccountId}-${AWS::Region}
+
+  ###############################################
+  # IAM Role for Firehose to Write to S3
+  ###############################################
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${SampledEventBucket}/*"
+
+  ###############################################
+  # Firehose Delivery Stream
+  ###############################################
+  SampleFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !Sub arn:aws:s3:::${SampledEventBucket}
+        RoleARN: !GetAtt FirehoseRole.Arn
+
+  ###############################################
+  # IAM Role for Lambda to Use Firehose
+  ###############################################
+  SamplerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaFirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function - Event Sampler
+  ###############################################
+  SamplerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 5
+      Role: !GetAtt SamplerLambdaRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_NAME: !Ref SampleFirehose
+      Code:
+        ZipFile: |
+          import boto3, os, json, random
+          firehose = boto3.client('firehose')
+
+          def lambda_handler(event, context):
+              sample_rate = 0.2  # 20% sampling
+              if random.random() <= sample_rate:
+                  print("📊 Event selected for sampling")
+                  firehose.put_record(
+                      DeliveryStreamName=os.environ['FIREHOSE_NAME'],
+                      Record={
+                          'Data': json.dumps(event).encode('utf-8')
+                      }
+                  )
+              else:
+                  print("🔕 Event skipped (not sampled)")
+
+  ###############################################
+  # EventBridge Bus and Rule to Send to Lambda
+  ###############################################
+  SamplerEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: sampler-bus
+
+  SamplerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SendToSampler
+      EventBusName: !Ref SamplerEventBus
+      EventPattern:
+        source: ["analytics.events"]
+      Targets:
+        - Id: SampleLambdaTarget
+          Arn: !GetAtt SamplerLambda.Arn
+
+  ###############################################
+  # Permission for EventBridge to Invoke Lambda
+  ###############################################
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SamplerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SamplerRule.Arn
+
+Outputs:
+  SampledBucket:
+    Value: !Ref SampledEventBucket
+  FirehoseName:
+    Value: !Ref SampleFirehose
+  LambdaName:
+    Value: !Ref SamplerLambda
+  EventBusName:
+    Value: !Ref SamplerEventBus

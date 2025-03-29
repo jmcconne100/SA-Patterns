@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda-Chained ETL Pipeline using S3 Triggers (Bronze → Silver → Gold)
+
+Resources:
+
+  ###############################################
+  # S3 Buckets for ETL Stages (Triggers must be connected manually)
+  ###############################################
+  # 📌 After deployment, go to each Lambda function in the AWS Console,
+  # click "Add Trigger", and connect the corresponding bucket and prefix:
+  #
+  # BronzeToSilver:
+  #   - Bucket: lambda-etl-bronze-*
+  #   - Prefix: bronze/
+  #   - Event type: ObjectCreated
+  #
+  # SilverToGold:
+  #   - Bucket: lambda-etl-silver-*
+  #   - Prefix: silver/
+  #   - Event type: ObjectCreated
+  ###############################################
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub lambda-etl-bronze-${AWS::AccountId}-${AWS::Region}
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub lambda-etl-silver-${AWS::AccountId}-${AWS::Region}
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub lambda-etl-gold-${AWS::AccountId}-${AWS::Region}
+
+  ###############################################
+  # IAM Role for All Lambda Functions
+  ###############################################
+  ETLLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaETLS3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ###############################################
+  # Bronze → Silver Lambda
+  ###############################################
+  BronzeToSilver:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt ETLLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 10
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref SilverBucket
+      Code:
+        ZipFile: |
+          import boto3, os, json, urllib.parse
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  src_bucket = record['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                  obj = s3.get_object(Bucket=src_bucket, Key=key)
+                  data = json.loads(obj['Body'].read())
+                  cleaned = {k: v for k, v in data.items() if v}
+                  new_key = key.replace("bronze/", "")
+                  s3.put_object(Bucket=os.environ['TARGET_BUCKET'], Key=f"silver/{new_key}", Body=json.dumps(cleaned))
+                  print(f"🔁 Bronze → Silver: {new_key}")
+
+  ###############################################
+  # Silver → Gold Lambda
+  ###############################################
+  SilverToGold:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt ETLLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 10
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref GoldBucket
+      Code:
+        ZipFile: |
+          import boto3, os, json, urllib.parse
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  src_bucket = record['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                  obj = s3.get_object(Bucket=src_bucket, Key=key)
+                  data = json.loads(obj['Body'].read())
+                  data['record_size'] = len(json.dumps(data))
+                  new_key = key.replace("silver/", "")
+                  s3.put_object(Bucket=os.environ['TARGET_BUCKET'], Key=f"gold/{new_key}", Body=json.dumps(data))
+                  print(f"🌟 Silver → Gold: {new_key}")
+
+  ###############################################
+  # Permissions for S3 to Invoke Lambda (manually wired later)
+  ###############################################
+  BronzeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BronzeToSilver
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt BronzeBucket.Arn
+
+  SilverInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SilverToGold
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt SilverBucket.Arn
+
+Outputs:
+  BronzeBucket:
+    Value: !Ref BronzeBucket
+  SilverBucket:
+    Value: !Ref SilverBucket
+  GoldBucket:
+    Value: !Ref GoldBucket

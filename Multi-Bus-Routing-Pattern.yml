@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Multi-Bus Event Routing for Microservice/Event Domain Separation
+
+Resources:
+
+  ###############################################
+  # Event Buses per Domain
+  ###############################################
+  AuthEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: auth-bus
+
+  BillingEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: billing-bus
+
+  AnalyticsEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: analytics-bus
+
+  ###############################################
+  # IAM Role for Router Lambda
+  ###############################################
+  RouterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MultiBusRoutingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function - Routes Events to Buses
+  ###############################################
+  EventRouterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt RouterLambdaRole.Arn
+      Timeout: 5
+      Code:
+        ZipFile: |
+          import boto3, os, json
+          eb = boto3.client('events')
+
+          def lambda_handler(event, context):
+              source = event.get('source')
+              if source == "app.auth":
+                  bus_name = "auth-bus"
+              elif source == "app.billing":
+                  bus_name = "billing-bus"
+              elif source == "app.analytics":
+                  bus_name = "analytics-bus"
+              else:
+                  print(f"⚠️ Unknown source: {source}, dropping event")
+                  return
+
+              print(f"📤 Routing to bus: {bus_name}")
+              eb.put_events(
+                  Entries=[{
+                      'Source': source,
+                      'DetailType': event.get('detail-type', 'generic'),
+                      'Detail': json.dumps(event.get('detail', {})),
+                      'EventBusName': bus_name
+                  }]
+              )
+
+  ###############################################
+  # Lambda Invoke Permission (for manual/integration use)
+  ###############################################
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventRouterLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Sub "${AWS::AccountId}"
+
+Outputs:
+  AuthBus:
+    Value: !Ref AuthEventBus
+  BillingBus:
+    Value: !Ref BillingEventBus
+  AnalyticsBus:
+    Value: !Ref AnalyticsEventBus
+  RouterLambda:
+    Value: !Ref EventRouterLambda
