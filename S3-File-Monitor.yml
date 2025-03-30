@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3-triggered Lambda with file size filtering and SNS alert
+
+Resources:
+
+  ###############################################
+  # S3 Bucket
+  ###############################################
+  FileUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub file-monitor-${AWS::AccountId}-${AWS::Region}
+
+  ###############################################
+  # SNS Topic for Alerts
+  ###############################################
+  FileAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: FileSizeAlert
+      TopicName: file-size-alert-topic
+
+  ###############################################
+  # IAM Role for Lambda
+  ###############################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowS3SNSLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - sns:Publish
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function
+  ###############################################
+  S3MonitorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          ALERT_TOPIC_ARN: !Ref FileAlertTopic
+          SIZE_THRESHOLD: "500000"  # bytes (500 KB)
+      Code:
+        ZipFile: |
+          import boto3, os
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              threshold = int(os.environ['SIZE_THRESHOLD'])
+              topic_arn = os.environ['ALERT_TOPIC_ARN']
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  size = record['s3']['object']['size']
+
+                  print(f"📁 New upload: {key} ({size} bytes)")
+
+                  if size > threshold:
+                      msg = f"⚠️ File {key} is {size} bytes, exceeding threshold."
+                      print(msg)
+                      sns.publish(TopicArn=topic_arn, Message=msg, Subject="Large File Alert")
+
+              return {"status": "processed"}
+
+  ###############################################
+  # S3 → Lambda Trigger
+  ###############################################
+  S3PermissionToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3MonitorLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt FileUploadBucket.Arn
+
+Outputs:
+  UploadBucket:
+    Description: Upload files here to trigger Lambda
+    Value: !Ref FileUploadBucket
+
+  AlertTopic:
+    Description: SNS Topic for large file alerts
+    Value: !Ref FileAlertTopic
+
+  LambdaFunction:
+    Description: Lambda that logs file info and sends alerts
+    Value: !Ref S3MonitorLambda

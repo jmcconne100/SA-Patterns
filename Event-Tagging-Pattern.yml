@@ -1,0 +1,90 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Event Tagging + Metadata Enrichment Pattern
+
+Resources:
+
+  ###############################################
+  # S3 Bucket for Tagged Output
+  ###############################################
+  TaggedOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub tagged-event-output-${AWS::AccountId}-${AWS::Region}
+
+  ###############################################
+  # IAM Role for Lambda
+  ###############################################
+  TaggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowS3Write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function - Enriches Metadata
+  ###############################################
+  TaggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt TaggerLambdaRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 10
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref TaggedOutputBucket
+      Code:
+        ZipFile: |
+          import boto3, os, json, uuid
+          from datetime import datetime
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              enriched = event.copy()
+              enriched['metadata'] = {
+                  'source_region': os.environ.get('AWS_REGION'),
+                  'event_tag': 'ingested',
+                  'ingestion_time': datetime.utcnow().isoformat()
+              }
+              key = f"tagged/{uuid.uuid4().hex}.json"
+              s3.put_object(
+                  Bucket=os.environ['OUTPUT_BUCKET'],
+                  Key=key,
+                  Body=json.dumps(enriched).encode('utf-8')
+              )
+              print(f"📥 Enriched and wrote to {key}")
+
+  ###############################################
+  # Lambda Permission (for EventBridge trigger or manual testing)
+  ###############################################
+  TaggerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TaggerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Sub "${AWS::AccountId}"
+
+Outputs:
+  BucketName:
+    Value: !Ref TaggedOutputBucket
+  LambdaFunction:
+    Value: !Ref TaggerLambda

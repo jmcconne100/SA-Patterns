@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lake Formation S3 Data Lake + Glue Crawler + Data Catalog (Auto Triggered)
+
+Resources:
+
+  ###############################################
+  # S3 Bucket to Serve as Data Lake Storage
+  ###############################################
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub data-lake-storage-${AWS::AccountId}-${AWS::Region}
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  ###############################################
+  # IAM Role for Glue Crawler with Lake Formation Permissions
+  ###############################################
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub GlueCrawlerLakeRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueCrawlerS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - glue:CreateDatabase
+                  - glue:UpdateDatabase
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:BatchDeleteTable
+                  - glue:StartCrawler
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+
+  ###############################################
+  # Glue Database for Crawled Metadata
+  ###############################################
+  DataLakeGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: data_lake_db
+
+  ###############################################
+  # Glue Crawler to Register Tables from S3
+  ###############################################
+  DataLakeGlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: data-lake-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref DataLakeGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${DataLakeBucket}/datasets/
+      TablePrefix: raw_
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+
+  ###############################################
+  # Lambda Role to Start Glue Crawler
+  ###############################################
+  TriggerCrawlerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub TriggerCrawlerLambdaRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartGlueCrawler
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function to Trigger the Glue Crawler
+  ###############################################
+  TriggerCrawlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 10
+      Role: !GetAtt TriggerCrawlerLambdaRole.Arn
+      Environment:
+        Variables:
+          CRAWLER_NAME: !Ref DataLakeGlueCrawler
+      Code:
+        ZipFile: |
+          import boto3, os
+
+          def lambda_handler(event, context):
+              print("🔁 File uploaded to data lake, starting crawler...")
+              glue = boto3.client('glue')
+              glue.start_crawler(Name=os.environ['CRAWLER_NAME'])
+              return {"status": "crawler started"}
+
+  ###############################################
+  # EventBridge Rule for S3 Put Events
+  ###############################################
+  TriggerCrawlerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Sub data-lake-storage-${AWS::AccountId}-${AWS::Region}
+          object:
+            key:
+              - prefix: datasets/
+      Targets:
+        - Arn: !GetAtt TriggerCrawlerLambda.Arn
+          Id: TriggerCrawlerLambdaTarget
+
+  ###############################################
+  # Permission for EventBridge to Trigger Lambda
+  ###############################################
+  TriggerCrawlerLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerCrawlerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerCrawlerRule.Arn
+
+Outputs:
+  DataLakeBucket:
+    Description: Upload structured/unstructured data to this bucket
+    Value: !Ref DataLakeBucket
+
+  GlueCrawlerName:
+    Description: Name of the Glue Crawler that discovers schema from uploaded files
+    Value: !Ref DataLakeGlueCrawler

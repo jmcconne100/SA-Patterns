@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Scheduled Snapshot + Archival to Glacier
+
+Resources:
+
+  ###############################################
+  # S3 Buckets for Source and Archival
+  ###############################################
+  SnapshotSourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub snapshot-source-${AWS::AccountId}-${AWS::Region}
+
+  SnapshotArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub snapshot-archive-${AWS::AccountId}-${AWS::Region}
+      LifecycleConfiguration:
+        Rules:
+          - Id: GlacierArchiveRule
+            Status: Enabled
+            Prefix: snapshots/
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 1
+
+  ###############################################
+  # IAM Role for Lambda Archiver
+  ###############################################
+  SnapshotArchiverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowS3Copy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function to Snapshot + Archive
+  ###############################################
+  SnapshotArchiver:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt SnapshotArchiverRole.Arn
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SnapshotSourceBucket
+          ARCHIVE_BUCKET: !Ref SnapshotArchiveBucket
+      Code:
+        ZipFile: |
+          import boto3, os
+
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              src_bucket = os.environ['SOURCE_BUCKET']
+              dst_bucket = os.environ['ARCHIVE_BUCKET']
+              resp = s3.list_objects_v2(Bucket=src_bucket)
+              for obj in resp.get('Contents', []):
+                  key = obj['Key']
+                  print(f"Archiving: {key}")
+                  copy_source = {'Bucket': src_bucket, 'Key': key}
+                  s3.copy_object(
+                      CopySource=copy_source,
+                      Bucket=dst_bucket,
+                      Key=f"snapshots/{key}"
+                  )
+              return {"status": "archived"}
+
+  ###############################################
+  # Scheduled Rule to Trigger Archiving
+  ###############################################
+  ArchiveSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 day)
+      Targets:
+        - Arn: !GetAtt SnapshotArchiver.Arn
+          Id: SnapshotArchiverLambdaTarget
+
+  ###############################################
+  # Permission for Scheduled Rule to Trigger Lambda
+  ###############################################
+  AllowScheduledInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SnapshotArchiver
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ArchiveSchedule.Arn
+
+Outputs:
+  SourceBucket:
+    Description: Upload data here to simulate snapshot source
+    Value: !Ref SnapshotSourceBucket
+  ArchiveBucket:
+    Description: Archived snapshots land here and transition to Glacier
+    Value: !Ref SnapshotArchiveBucket

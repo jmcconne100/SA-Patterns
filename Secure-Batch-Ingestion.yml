@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure Batch Ingestion with S3 + EventBridge + Lambda
+
+Resources:
+
+  ###############################################
+  # Secure S3 Bucket for Uploading Batch Files
+  ###############################################
+  IngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub secure-batch-ingestion-${AWS::AccountId}-${AWS::Region}
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+
+  ###############################################
+  # EventBridge Rule for S3 Object Creation Events
+  ###############################################
+  IngestionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SecureBatchIngestionRule
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Sub secure-batch-ingestion-${AWS::AccountId}-${AWS::Region}
+      Targets:
+        - Arn: !GetAtt IngestionLambda.Arn
+          Id: IngestionLambdaTarget
+
+  ###############################################
+  # IAM Role for Lambda (S3 Read + Logs)
+  ###############################################
+  IngestionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadAndLog
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ###############################################
+  # Lambda Function to Process Uploaded File Metadata
+  ###############################################
+  IngestionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt IngestionLambdaRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+
+          def lambda_handler(event, context):
+              print("📦 Ingestion event:", json.dumps(event))
+              # You could trigger an ETL pipeline here
+              return { "status": "success" }
+
+  ###############################################
+  # Grant EventBridge Permission to Trigger Lambda
+  ###############################################
+  IngestionLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestionLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IngestionEventRule.Arn
+
+Outputs:
+  S3Bucket:
+    Description: Upload batch files to this bucket
+    Value: !Ref IngestionBucket
+
+  LambdaFunction:
+    Description: Lambda that receives S3 creation notifications
+    Value: !Ref IngestionLambda
