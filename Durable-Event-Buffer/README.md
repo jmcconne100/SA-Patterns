@@ -50,6 +50,34 @@ aws events put-events \
   ]'
 ```
 
+# Diagram
+```
+                        +--------------------+
+                        |  Event Producer(s) |
+                        +---------+----------+
+                                  |
+                                  v
+                     +---------------------------+
+                     |    EventBridge (Custom)   |
+                     |     durable-event-bus     |
+                     +------+----------+---------+
+                            |          |
+              +-------------+          +--------------+
+              |                               |
+              v                               v
++---------------------------+     +------------------------+
+| Lambda: S3BufferLambda    |     | SQS Queue:             |
+| - Writes full event to S3 |     | durable-fanout-queue   |
++------------+--------------+     +-----------+------------+
+             |                                  |
+             v                                  v
+   +-----------------------+          +----------------------+
+   | S3 Bucket             |          | SQS Consumers /      |
+   | durable-event-buffer  |          | Workers / Lambda     |
+   | (raw-events/ prefix)  |          |                      |
+   +-----------------------+          +----------------------+
+```
+
 # Delivery Notes:
 Events are immediately delivered to both S3 (via Lambda) and the SQS queue.
 Events stored in S3 are complete payloads in JSON format.
